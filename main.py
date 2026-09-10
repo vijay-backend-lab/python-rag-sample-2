@@ -3,10 +3,12 @@ import math
 import os
 from dotenv import load_dotenv
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import AfterValidator, BaseModel
+from fastapi.responses import PlainTextResponse
+from pydantic import AfterValidator
 
 app = FastAPI(title="Query API")
 
@@ -24,18 +26,11 @@ def validate_question(value: str) -> str:
     return question
 
 
-class QueryResponse(BaseModel):
-    query: str
-    embedding: list[float]
-    model: str
-
-
 async def embed_question(question: str) -> list[float]:
     """Create a retrieval vector that later pipeline steps can consume."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    print(bool(api_key))
     if not api_key:
-        raise HTTPException(503, "Embedding service is not configured.Vijay")
+        raise HTTPException(503, "Embedding service is not configured.")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -63,12 +58,67 @@ async def embed_question(question: str) -> list[float]:
         raise HTTPException(502, "Embedding service returned an invalid vector.") from exc
 
 
-@app.get("/query", response_model=QueryResponse)
+async def search_document(embedding: list[float]) -> str:
+    """Return the nearest document's text, without search metadata or vectors."""
+    url = os.environ.get("ELASTICSEARCH_URL", "").strip().rstrip("/")
+    username = os.environ.get("ELASTICSEARCH_USERNAME", "").strip()
+    password = os.environ.get("ELASTICSEARCH_PASSWORD", "")
+    index = os.environ.get("ELASTICSEARCH_INDEX", "").strip()
+    vector_field = os.environ.get("ELASTICSEARCH_VECTOR_FIELD", "").strip()
+    text_field = os.environ.get("ELASTICSEARCH_TEXT_FIELD", "").strip()
+    if not all((url, username, password, index, vector_field, text_field)):
+        raise HTTPException(503, "Elasticsearch is not configured.")
+    if not url.startswith(("https://", "http://")):
+        raise HTTPException(503, "Elasticsearch URL must use HTTP or HTTPS.")
+    try:
+        async with httpx.AsyncClient(timeout=30.0, auth=(username, password), verify=False) as client:
+            
+            response = await client.post(
+                f"{url}/{quote(index, safe='')}/_search",
+                json={
+                    "size": 1,
+                    "_source": [text_field],
+                    "knn": {
+                        "field": vector_field,
+                        "query_vector": embedding,
+                        "k": 1,
+                        "num_candidates": 100,
+                    },
+                },
+            )
+            response.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "Elasticsearch search timed out.") from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(502, "Elasticsearch search failed.") from exc
+    try:
+        result = response.json()
+        if result.get("timed_out") or result.get("_shards", {}).get("failed", 0):
+            raise ValueError("Incomplete search")
+        hits = result["hits"]["hits"]
+        if not isinstance(hits, list):
+            raise ValueError("Invalid hits")
+        if not hits:
+            raise HTTPException(404, "No matching document found.")
+        source = hits[0]["_source"]
+        if text_field in source:
+            document = source[text_field]
+        else:
+            document = source
+            for part in text_field.split("."):
+                document = document[part]
+        if not isinstance(document, str) or not document.strip():
+            raise ValueError("Missing document text")
+        return document
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise HTTPException(502, "Elasticsearch returned an invalid document.") from exc
+
+
+@app.get("/query", response_class=PlainTextResponse)
 async def query(query: Annotated[
     str,
     Query(min_length=1, max_length=2000, description="The user's question."),
     AfterValidator(validate_question),
-]) -> QueryResponse:
+]) -> str:
     embedding = await embed_question(query)
-    return QueryResponse(query=query, embedding=embedding, model=EMBEDDING_MODEL)
-
+    return await search_document(embedding)

@@ -19,14 +19,24 @@ class ApiTests(unittest.TestCase):
         self.status = 200
         self.payload = {"embedding": {"values": [0.1, -0.2, 0.3]}}
         self.timeout = False
+        self.search_status = 200
+        self.search_timeout = False
+        self.search_payload = {"hits": {"hits": [{"_source": {"content": "Retrieved document. नमस्ते"}}]}}
 
         def respond(request):
             self.requests.append(request)
+            if request.url.host == "elastic.test":
+                if self.search_timeout:
+                    raise httpx.ReadTimeout("private details", request=request)
+                return httpx.Response(self.search_status, json=self.search_payload)
             if self.timeout:
                 raise httpx.ReadTimeout("private upstream details", request=request)
             return httpx.Response(self.status, json=self.payload)
 
-        self.env = patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"})
+        self.env = patch.dict(os.environ, {"GEMINI_API_KEY": "test-key",
+            "ELASTICSEARCH_URL": "https://elastic.test", "ELASTICSEARCH_USERNAME": "test-user",
+            "ELASTICSEARCH_PASSWORD": "test-password", "ELASTICSEARCH_INDEX": "structural-rag-index",
+            "ELASTICSEARCH_VECTOR_FIELD": "embedding", "ELASTICSEARCH_TEXT_FIELD": "content"})
         self.env.start()
         self.addCleanup(self.env.stop)
         mock = patch("main.httpx.AsyncClient", side_effect=lambda **kwargs: REAL_CLIENT(
@@ -41,9 +51,16 @@ class ApiTests(unittest.TestCase):
             with self.subTest(question=question):
                 response = self.client.get("/query", params={"query": question})
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.json(), {"query": question.strip(),
-                    "embedding": [0.1, -0.2, 0.3], "model": EMBEDDING_MODEL})
-                request = self.requests[-1]
+                self.assertEqual(response.text, "Retrieved document. नमस्ते")
+                self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
+                search = self.requests[-1]
+                self.assertEqual(str(search.url), "https://elastic.test/structural-rag-index/_search")
+                self.assertTrue(search.headers["authorization"].startswith("Basic "))
+                self.assertNotIn("x-goog-api-key", search.headers)
+                self.assertEqual(json.loads(search.content), {
+                    "size": 1, "_source": ["content"], "knn": {"field": "embedding",
+                    "query_vector": [0.1, -0.2, 0.3], "k": 1, "num_candidates": 100}})
+                request = self.requests[-2]
                 self.assertEqual(request.headers["x-goog-api-key"], "test-key")
                 self.assertEqual(json.loads(request.content), {
                     "model": f"models/{EMBEDDING_MODEL}",
@@ -80,6 +97,42 @@ class ApiTests(unittest.TestCase):
             self.payload = payload
             self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 502)
 
+    def test_search_configuration(self):
+        for name in ["ELASTICSEARCH_URL", "ELASTICSEARCH_USERNAME", "ELASTICSEARCH_PASSWORD",
+                     "ELASTICSEARCH_INDEX", "ELASTICSEARCH_VECTOR_FIELD", "ELASTICSEARCH_TEXT_FIELD"]:
+            with self.subTest(name=name), patch.dict(os.environ, {name: ""}):
+                self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 503)
+        self.assertFalse(any(r.url.host == "elastic.test" for r in self.requests))
+
+    def test_search_failures(self):
+        for status in [401, 404, 429, 500]:
+            self.search_status = status
+            response = self.client.get("/query", params={"query": "Why?"})
+            self.assertEqual(response.status_code, 502)
+            self.assertNotIn("test-password", response.text)
+        self.search_timeout = True
+        self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 504)
+
+    def test_no_matches(self):
+        self.search_payload = {"hits": {"hits": []}}
+        self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 404)
+
+    def test_invalid_documents(self):
+        for payload in [{}, {"hits": {"hits": None}}, {"hits": {"hits": [{"_source": {}}]}},
+                        {"hits": {"hits": [{"_source": {"content": 123}}]}},
+                        {"hits": {"hits": [{"_source": {"content": " "}}]}},
+                        {"timed_out": True}, {"_shards": {"failed": 1}}]:
+            with self.subTest(payload=payload):
+                self.search_payload = payload
+                self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 502)
+
+    def test_nested_text_field(self):
+        self.search_payload = {"hits": {"hits": [{"_source": {"document": {"text": "Nested text"}}}]}}
+        with patch.dict(os.environ, {"ELASTICSEARCH_TEXT_FIELD": "document.text"}):
+            response = self.client.get("/query", params={"query": "Why?"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.text, "Nested text")
+
     def test_routes(self):
         self.assertEqual(self.client.get("/missing").status_code, 404)
         self.assertEqual(self.client.post("/query").status_code, 405)
@@ -88,7 +141,7 @@ class ApiTests(unittest.TestCase):
         event = json.loads((ROOT / "events/query.json").read_text())
         response = lambda_handler(event, None)
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(json.loads(response["body"])["embedding"], [0.1, -0.2, 0.3])
+        self.assertEqual(response["body"], "Retrieved document. नमस्ते")
 
     def test_lambda_v1(self):
         event = {"resource": "/query", "path": "/query", "httpMethod": "GET",
@@ -96,7 +149,7 @@ class ApiTests(unittest.TestCase):
                  "queryStringParameters": {"query": "What is RAG?"}, "body": None}
         response = lambda_handler(event, None)
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(json.loads(response["body"])["query"], "What is RAG?")
+        self.assertEqual(response["body"], "Retrieved document. नमस्ते")
 
 
 if __name__ == "__main__":
