@@ -1,71 +1,60 @@
 # FastAPI query API
 
-GET /query?query=hello returns plain text: Your query was 'hello'.
-The required query parameter is a string; empty strings are accepted.
-Missing parameters now return FastAPI's standard 422 validation response.
+`GET /query?query=What%20is%20RAG%3F` validates a user's question and generates
+its vector with Gemini `gemini-embedding-001` using `RETRIEVAL_QUERY`.
 
-- main.py: FastAPI app and endpoint.
-- lambda_function.py: separate Mangum adapter for AWS Lambda.
-- pyproject.toml: project metadata and dependencies.
+The required query is limited to 2,000 characters before trimming. Leading and
+trailing whitespace is removed. Blank input, text without any letters, and
+embedded control characters (except tabs and line breaks) return HTTP 422
+without calling Gemini. Unicode questions are supported. Validation checks text
+shape, not meaning: it does not attempt to prove that text is a question or
+require a question mark.
+
+The response is now JSON rather than plain text:
+
+```json
+{"query": "What is RAG?", "embedding": [0.1, -0.2, 0.3], "model": "gemini-embedding-001"}
+```
+
+The vector above is illustrative. `embed_question()` returns the actual vector
+for a future retrieval step; no vector search or answer generation is performed.
 
 ## Run locally (Python 3.11+)
 
-From this project folder in VS terminal:
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[test]"
+$env:GEMINI_API_KEY = "your-api-key"
+python -m uvicorn main:app --reload
+```
 
-    python -m venv .venv
-    pip install -e ".[test]"
-    python -m uvicorn main:app --reload
-
-Open http://127.0.0.1:8000/docs to try the API in Swagger UI, or run:
-
-    curl.exe "http://127.0.0.1:8000/query?query=hello"
-
-Use Ctrl+C to stop. Add --port 8080 to the Uvicorn command to change the port.
+Open http://127.0.0.1:8000/docs to try the API.
+The key is read from the environment; `.env` files are not automatically loaded.
+Missing configuration returns 503, upstream failures return 502, and upstream
+timeouts return 504. Provider error details and credentials are not returned.
 
 ## Build and test
-    <!-- Create the zip for aws lambda function -->
-    python build_zip.py
-    python -m unittest discover -s tests -v
 
+```powershell
+python -m unittest discover -s tests -v
+python build_zip.py
+python tests/check_deployment.py
+```
+
+Tests mock Gemini HTTP calls and require no API key or network access.
+Rebuild the deployment archive after source or dependency changes.
 
 ## AWS Lambda
 
-1. Create or configure a function with **Python 3.12**, architecture **x86_64**,
-   and a basic Lambda execution role.
-2. Upload dist/lambda-query-api.zip under Code > Upload from > .zip file.
-3. Set the handler to **lambda_function.lambda_handler**.
-4. Connect an API Gateway HTTP API route **GET /query** to the Lambda using
-   payload format **2.0** and enable automatic deployment on the $default stage.
-   Allow API Gateway to invoke the function during setup.
-5. Call https://YOUR_API_ID.execute-api.YOUR_REGION.amazonaws.com/query?query=hello.
+1. Build and upload `dist/lambda-query-api.zip` to a Python 3.12, x86_64 function.
+2. Set the handler to `lambda_function.lambda_handler`.
+3. Set the `GEMINI_API_KEY` environment variable and allow outbound HTTPS access.
+4. Connect API Gateway route `GET /query` (payload format 2.0).
+5. Allow API Gateway to invoke the function. Route `/docs` and `/openapi.json`
+   as well if Swagger UI is needed.
 
-Paste events/query.json into a Lambda console test to test the handler directly.
-The console displays the response envelope; HTTP callers receive its plain-text body.
-For Swagger UI on AWS, also route /docs and /openapi.json to this Lambda.
+Use `events/query.json` for a Lambda console test. HTTP callers receive JSON.
 
-
-## Test aws lambda function
-```
-{
-  "version": "2.0",
-  "routeKey": "GET /query",
-  "rawPath": "/query",
-  "rawQueryString": "query=hello",
-  "headers": {
-    "host": "localhost"
-  },
-  "requestContext": {
-    "http": {
-      "method": "GET",
-      "path": "/query",
-      "sourceIp": "127.0.0.1",
-      "protocol": "HTTP/1.1"
-    }
-  },
-  "queryStringParameters": {
-    "query": "hello"
-  },
-  "isBase64Encoded": false
-}
-```
+Gemini API reference: https://ai.google.dev/api/embeddings
 
