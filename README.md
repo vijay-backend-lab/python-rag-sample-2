@@ -2,9 +2,15 @@
 
 `GET /query?query=What%20is%20RAG%3F` validates the question, embeds it with
 Gemini `gemini-embedding-001` (`RETRIEVAL_QUERY`), and uses that vector for an
-Elasticsearch kNN search. The nearest document's configured text field is
-returned directly as `text/plain; charset=utf-8`, with no JSON wrapper,
-embedding, score, or other search metadata. No answer generation is performed.
+Elasticsearch kNN search. The nearest chunk's content and the validated question
+are sent to `gemini-2.5-flash-lite` to generate an answer. The answer is returned
+as `text/plain; charset=utf-8`, without a JSON wrapper or search metadata.
+This is a direct REST-based RAG pipeline, with no ingestion service or RAG framework.
+
+The generation prompt tells Gemini to answer only from the retrieved context,
+state when the context is insufficient, and treat document text as data rather
+than instructions. This encourages grounding but does not guarantee factual accuracy.
+The same `GEMINI_API_KEY` is used for embeddings and generation.
 
 ## Configuration
 
@@ -27,7 +33,7 @@ ELASTICSEARCH_VECTOR_FIELD=embedding
 ELASTICSEARCH_TEXT_FIELD=content
 ```
 
-The response is the nearest chunk's content, not the entire parent document.
+The nearest chunk's content is used as generation context; the parent document is not fetched.
 
 All settings are required. The index must support Elasticsearch's top-level
 `knn` search API. Its vectors must use the same embedding model and dimensions
@@ -39,7 +45,8 @@ The search requests one nearest document with 100 candidates per shard.
 There is no minimum similarity threshold. Empty results return 404; missing or
 non-string document text and upstream failures return 502; timeouts return 504;
 missing configuration returns 503. Error responses use FastAPI's JSON `detail`
-format. Only successful responses contain the document string.
+format. Successful responses contain only the generated answer string. Blocked, empty,
+malformed, or truncated generation responses return 502.
 
 ## Validation
 
@@ -68,7 +75,7 @@ python build_zip.py
 python tests/check_deployment.py
 ```
 
-API tests mock both Gemini and Elasticsearch and require no live credentials.
+API tests mock Gemini embeddings, Gemini generation, and Elasticsearch and require no live credentials.
 Rebuild the deployment archive after source or dependency changes.
 
 ## AWS Lambda
@@ -82,7 +89,10 @@ Rebuild the deployment archive after source or dependency changes.
    as well if Swagger UI is needed.
 
 Use `events/query.json` for a Lambda console test. Successful HTTP responses
-contain only the matched document's text.
+contain only the generated answer. Each upstream request has a 30-second timeout;
+configure Lambda and gateway timeouts to accommodate the three sequential calls.
 
 References: https://ai.google.dev/api/embeddings and
 https://www.elastic.co/docs/solutions/search/vector/knn
+
+Generation API reference: https://ai.google.dev/api/generate-content
