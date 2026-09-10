@@ -1,0 +1,21 @@
+{
+  "version": "2.0",
+  "routeKey": "GET /query",
+  "rawPath": "/query",
+  "rawQueryString": "query=hello",
+  "headers": {
+    "host": "localhost"
+  },
+  "requestContext": {
+    "http": {
+      "method": "GET",
+      "path": "/query",
+      "sourceIp": "127.0.0.1",
+      "protocol": "HTTP/1.1"
+    }
+  },
+  "queryStringParameters": {
+    "query": "hello"
+  },
+  "isBase64Encoded": false
+}
