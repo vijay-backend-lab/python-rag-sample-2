@@ -28,6 +28,25 @@ def validate_question(value: str) -> str:
     return question
 
 
+def parse_min_score(value: str) -> float:
+    """Parse the optional relevance threshold.
+
+    An unset or blank value disables relevance filtering (returns 0.0). A set
+    value must be a finite, non-negative number; anything else is a
+    configuration error surfaced as a 503.
+    """
+    text = value.strip()
+    if not text:
+        return 0.0
+    try:
+        score = float(text)
+    except ValueError as exc:
+        raise HTTPException(503, "Elasticsearch minimum score must be a number.") from exc
+    if not math.isfinite(score) or score < 0:
+        raise HTTPException(503, "Elasticsearch minimum score must be a non-negative number.")
+    return score
+
+
 async def embed_question(question: str) -> list[float]:
     """Create a retrieval vector that later pipeline steps can consume."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -60,8 +79,15 @@ async def embed_question(question: str) -> list[float]:
         raise HTTPException(502, "Embedding service returned an invalid vector.") from exc
 
 
-async def search_document(embedding: list[float]) -> str:
-    """Return the nearest document's text, without search metadata or vectors."""
+async def search_document(question: str, embedding: list[float]) -> str:
+    """Return the nearest document's text, without search metadata or vectors.
+
+    Uses hybrid retrieval: a BM25 keyword match on the text field is combined
+    with a semantic kNN search on the vector field in a single request. When
+    both a ``query`` and a ``knn`` clause are present, Elasticsearch runs each
+    search independently and combines the results by summing their scores, so
+    the returned top hit reflects both lexical and semantic relevance.
+    """
     url = os.environ.get("ELASTICSEARCH_URL", "").strip().rstrip("/")
     username = os.environ.get("ELASTICSEARCH_USERNAME", "").strip()
     password = os.environ.get("ELASTICSEARCH_PASSWORD", "")
@@ -72,21 +98,36 @@ async def search_document(embedding: list[float]) -> str:
         raise HTTPException(503, "Elasticsearch is not configured.")
     if not url.startswith(("https://", "http://")):
         raise HTTPException(503, "Elasticsearch URL must use HTTP or HTTPS.")
+    min_score = parse_min_score(os.environ.get("ELASTICSEARCH_MIN_SCORE", ""))
+    body = {
+        "size": 1,
+        "_source": [text_field],
+        "query": {
+            "match": {
+                text_field: {
+                    "query": question,
+                },
+            },
+        },
+        "knn": {
+            "field": vector_field,
+            "query_vector": embedding,
+            "k": 1,
+            "num_candidates": 100,
+        },
+    }
+    # Relevance filtering: ask Elasticsearch to drop hits whose combined
+    # (BM25 + kNN) score falls below the configured threshold, so weak matches
+    # never reach the prompt. Omitted entirely when unset/zero for backward
+    # compatibility, in which case the top hit is used regardless of score.
+    if min_score > 0:
+        body["min_score"] = min_score
     try:
         async with httpx.AsyncClient(timeout=30.0, auth=(username, password), verify=False) as client:
-            
+
             response = await client.post(
                 f"{url}/{quote(index, safe='')}/_search",
-                json={
-                    "size": 1,
-                    "_source": [text_field],
-                    "knn": {
-                        "field": vector_field,
-                        "query_vector": embedding,
-                        "k": 1,
-                        "num_candidates": 100,
-                    },
-                },
+                json=body,
             )
             response.raise_for_status()
     except httpx.TimeoutException as exc:
@@ -170,5 +211,5 @@ async def query(query: Annotated[
     AfterValidator(validate_question),
 ]) -> str:
     embedding = await embed_question(query)
-    context = await search_document(embedding)
+    context = await search_document(query, embedding)
     return await generate_answer(query, context)

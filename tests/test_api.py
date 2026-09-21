@@ -74,7 +74,9 @@ class ApiTests(unittest.TestCase):
                 self.assertTrue(search.headers["authorization"].startswith("Basic "))
                 self.assertNotIn("x-goog-api-key", search.headers)
                 self.assertEqual(json.loads(search.content), {
-                    "size": 1, "_source": ["content"], "knn": {"field": "embedding",
+                    "size": 1, "_source": ["content"],
+                    "query": {"match": {"content": {"query": question.strip()}}},
+                    "knn": {"field": "embedding",
                     "query_vector": [0.1, -0.2, 0.3], "k": 1, "num_candidates": 100}})
                 request = self.requests[-3]
                 self.assertEqual(request.headers["x-goog-api-key"], "test-key")
@@ -132,6 +134,30 @@ class ApiTests(unittest.TestCase):
     def test_no_matches(self):
         self.search_payload = {"hits": {"hits": []}}
         self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 404)
+
+    def test_min_score_applied(self):
+        with patch.dict(os.environ, {"ELASTICSEARCH_MIN_SCORE": "1.5"}):
+            response = self.client.get("/query", params={"query": "Why?"})
+        self.assertEqual(response.status_code, 200)
+        search = next(r for r in self.requests if r.url.host == "elastic.test")
+        self.assertEqual(json.loads(search.content)["min_score"], 1.5)
+
+    def test_min_score_filters_weak_matches(self):
+        # Elasticsearch drops sub-threshold hits, so the response has no hits.
+        self.search_payload = {"hits": {"hits": []}}
+        with patch.dict(os.environ, {"ELASTICSEARCH_MIN_SCORE": "5"}):
+            self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 404)
+        self.assertFalse(any(r.url.path.endswith(":generateContent") for r in self.requests))
+
+    def test_min_score_omitted_by_default(self):
+        self.client.get("/query", params={"query": "Why?"})
+        search = next(r for r in self.requests if r.url.host == "elastic.test")
+        self.assertNotIn("min_score", json.loads(search.content))
+
+    def test_invalid_min_score(self):
+        for value in ["abc", "-1", "nan", "inf"]:
+            with self.subTest(value=value), patch.dict(os.environ, {"ELASTICSEARCH_MIN_SCORE": value}):
+                self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 503)
 
     def test_invalid_documents(self):
         for payload in [{}, {"hits": {"hits": None}}, {"hits": {"hits": [{"_source": {}}]}},

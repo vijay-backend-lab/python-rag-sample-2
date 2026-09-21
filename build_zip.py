@@ -21,7 +21,8 @@ def main():
             "--no-compile", "--target", str(staging),
             *metadata["project"]["dependencies"],
         ], check=True)
-        for name in ("main.py", "lambda_function.py"):
+        for module in metadata["tool"]["setuptools"]["py-modules"]:
+            name = f"{module}.py"
             (staging / name).write_bytes((root / name).read_bytes())
         with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
             for path in sorted(staging.rglob("*")):

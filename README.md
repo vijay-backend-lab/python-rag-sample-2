@@ -1,8 +1,11 @@
 # FastAPI query API
 
 `GET /query?query=What%20is%20RAG%3F` validates the question, embeds it with
-Gemini `gemini-embedding-001` (`RETRIEVAL_QUERY`), and uses that vector for an
-Elasticsearch kNN search. The nearest chunk's content and the validated question
+Gemini `gemini-embedding-001` (`RETRIEVAL_QUERY`), and runs a hybrid Elasticsearch
+search that combines a BM25 keyword `match` on the text field with a semantic kNN
+search on the vector field in a single request. Elasticsearch runs both searches
+and combines them by summing their scores, so the top hit reflects both lexical
+and semantic relevance. The nearest chunk's content and the validated question
 are sent to `gemini-2.5-flash-lite` to generate an answer. The answer is returned
 as `text/plain; charset=utf-8`, without a JSON wrapper or search metadata.
 This is a direct REST-based RAG pipeline, with no ingestion service or RAG framework.
@@ -24,6 +27,13 @@ variables take precedence over `.env`. The file name is `.env`, not `.evn`.
 - `ELASTICSEARCH_VECTOR_FIELD`: indexed `dense_vector` field.
 - `ELASTICSEARCH_TEXT_FIELD`: string field in `_source` to return. Dotted paths
   such as `document.text` are supported for ordinary object fields.
+- `ELASTICSEARCH_MIN_SCORE` (optional): relevance threshold. When set to a
+  positive number, Elasticsearch drops hits whose combined (BM25 + kNN) score is
+  below it, so weak matches never reach the prompt and yield a 404 instead. Unset
+  or `0` disables filtering (the top hit is used regardless of score). Because
+  hybrid scores are unbounded and index-dependent, tune this against your own
+  index rather than assuming a fixed value. A non-numeric or negative value
+  returns 503.
 
 `.env.example` ships generic placeholders (for example `ELASTICSEARCH_INDEX=index_name`).
 Replace them with your index's real names. For an index whose vector field is
@@ -43,8 +53,15 @@ as the query (Gemini's default 3072 dimensions). Index document embeddings using
 `RETRIEVAL_DOCUMENT`. An existing index using a different model or dimensionality
 needs compatible embeddings before this query pipeline can search it.
 
-The search requests one nearest document with 100 candidates per shard.
-There is no minimum similarity threshold. Empty results return 404; missing or
+The search is hybrid: a BM25 `match` on `ELASTICSEARCH_TEXT_FIELD` runs alongside
+the kNN vector search, and Elasticsearch combines the two by summing their scores.
+This uses only core Elasticsearch features (no RRF/rank tier), so it works on the
+basic tier. The text field must be a searchable `text` type for the keyword half
+to contribute; a `keyword`-only field limits it to exact matches. The search
+requests one nearest document with 100 candidates per shard. A relevance
+threshold is applied when `ELASTICSEARCH_MIN_SCORE` is set (see Configuration);
+otherwise there is no minimum similarity threshold. Empty results (including hits
+dropped by the threshold) return 404; missing or
 non-string document text and upstream failures return 502; timeouts return 504;
 missing configuration returns 503. Error responses use FastAPI's JSON `detail`
 format. Successful responses contain only the generated answer string. Blocked, empty,
@@ -58,16 +75,71 @@ control characters other than tabs and line breaks return 422 before any
 upstream call. Unicode is supported. Validation checks text format rather than
 whether the input semantically asks a question; a question mark is not required.
 
+## Ingestion API
+
+`ingestion.py` is a second FastAPI app (`POST /ingest`) that populates the index
+the query API searches. It is the ingestion pipeline the query side assumes
+already exists: PDF text extraction, chunking, metadata enrichment, document
+embedding, and Elasticsearch indexing.
+
+Send a `multipart/form-data` request:
+
+- `file` (required): the PDF to ingest.
+- `document_id` (required): a stable identifier for the source document. Chunks
+  are indexed with `_id` of `{document_id}:{chunk_index}`, so re-ingesting the
+  same `document_id` overwrites its chunks.
+- `title`, `document_type`, `version`, `effective_date`, `department`, `status`
+  (optional): metadata stored on every chunk and usable later for retrieval
+  filtering. `effective_date` must be an ISO date (`YYYY-MM-DD`); blank optional
+  fields are omitted.
+- `chunk_size`, `chunk_overlap` (optional): character-based chunk length and
+  overlap. Defaults are 1500 and 200. Overlap must be zero or more and smaller
+  than the chunk size.
+
+The pipeline extracts text per page (pages with no extractable text are skipped),
+chunks each page independently with overlap (so a chunk never spans a page
+break), embeds each chunk with Gemini `gemini-embedding-001` using
+`RETRIEVAL_DOCUMENT` (matching the query side's `RETRIEVAL_QUERY`), and bulk-indexes
+one document per chunk with `refresh=wait_for`. Each indexed document contains the
+text field, the vector field, `document_id`, `chunk_index`, and any supplied
+metadata. On success it returns `{"document_id": ..., "chunks_indexed": N}`.
+
+Ingestion reuses the same `ELASTICSEARCH_*` and `GEMINI_API_KEY` settings as the
+query API. `ELASTICSEARCH_VECTOR_FIELD` and `ELASTICSEARCH_TEXT_FIELD` must be
+flat (non-dotted) names for indexing. `ELASTICSEARCH_MIN_SCORE` is query-only and
+ignored here.
+
+The index is created automatically when it does not exist. Before bulk-indexing,
+ingestion issues a `HEAD` to check for the index and, if absent, `PUT`s a mapping
+that sets the vector field to `dense_vector` (with `dims` taken from the actual
+embedding length, so it always matches the model output), the text field to
+searchable `text`, and the metadata fields (`document_id`, `chunk_index`,
+`document_type`, `version`, `effective_date`, `department`, `status`, `title`) to
+`keyword`/`integer`/`date`/`text` types so later retrieval filtering works. An
+existing index is never modified — its mapping is assumed compatible. Set
+`ELASTICSEARCH_SIMILARITY` (`cosine` default, or `dot_product`, `l2_norm`,
+`max_inner_product`) to control the vector similarity of a newly created index.
+A concurrent creator that wins the race is treated as success. Index-creation
+failures return 502 (504 on timeout); an invalid similarity returns 503.
+
+Errors mirror the query API: missing configuration returns 503; an empty file,
+an unreadable PDF, no extractable text, an invalid `effective_date`, or invalid
+chunk parameters return 422; a PDF producing more than 500 chunks returns 413;
+embedding, index-creation, or Elasticsearch indexing failures return 502; timeouts
+return 504; an invalid `ELASTICSEARCH_SIMILARITY` returns 503.
+
 ## Run locally (Python 3.11+)
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -e .
-python -m uvicorn main:app --reload
+python -m uvicorn main:app --reload       # query API
+python -m uvicorn ingestion:app --reload  # ingestion API
 ```
 
-Configure `.env` first, then open http://127.0.0.1:8000/docs.
+Configure `.env` first, then open http://127.0.0.1:8000/docs. Run one app per
+port (for example add `--port 8001` to the second).
 
 ## Build and test
 
@@ -78,24 +150,33 @@ python tests/check_deployment.py
 ```
 
 API tests mock Gemini embeddings, Gemini generation, and Elasticsearch and require no live
-credentials. They use only `unittest`, FastAPI's test client, and `httpx`, all installed by
-`pip install -e .`, so no extra test dependencies are needed.
-Rebuild the deployment archive after source or dependency changes.
+credentials. They use only `unittest`, FastAPI's test client, `httpx`, and (for the
+ingestion tests) `pypdf`, all installed by `pip install -e .`, so no extra test
+dependencies are needed. Rebuild the deployment archive after source or dependency changes.
 
 ## AWS Lambda
 
+The single `dist/lambda-query-api.zip` contains both apps. Deploy each as its own
+Python 3.12, x86_64 function that shares the same code but a different handler.
+
 1. Build and upload `dist/lambda-query-api.zip` to a Python 3.12, x86_64 function.
-2. Set the handler to `lambda_function.lambda_handler`.
-3. Configure the variables above in Lambda; `.env` is not included in the ZIP.
-   Allow outbound access to Gemini and Elasticsearch.
-4. Connect API Gateway route `GET /query`. The handler supports both HTTP API
-   payload format 2.0 and REST API payload format 1.0.
+2. Set the handler:
+   - Query API: `lambda_function.lambda_handler` (route `GET /query`).
+   - Ingestion API: `ingestion_lambda.lambda_handler` (route `POST /ingest`).
+3. Configure the variables above in each function; `.env` is not included in the
+   ZIP. Allow outbound access to Gemini and Elasticsearch.
+4. Connect the API Gateway route to the matching function. Both handlers support
+   HTTP API payload format 2.0 and REST API payload format 1.0. For `POST /ingest`,
+   enable binary media type `multipart/form-data` on the API so the uploaded PDF
+   reaches the function intact.
 5. Allow API Gateway to invoke the function. Route `/docs` and `/openapi.json`
    as well if Swagger UI is needed.
 
-Use `events/query.json` for a Lambda console test. Successful HTTP responses
-contain only the generated answer. Each upstream request has a 30-second timeout;
-configure Lambda and gateway timeouts to accommodate the three sequential calls.
+Use `events/query.json` for a query-side Lambda console test. Successful query
+responses contain only the generated answer. Each upstream request has a 30-second
+timeout; configure Lambda and gateway timeouts to accommodate the sequential
+calls. Ingestion embeds one chunk per request, so give the ingestion function a
+higher timeout for large documents.
 
 References: https://ai.google.dev/api/embeddings and
 https://www.elastic.co/docs/solutions/search/vector/knn
