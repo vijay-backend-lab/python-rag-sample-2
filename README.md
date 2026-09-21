@@ -25,10 +25,12 @@ variables take precedence over `.env`. The file name is `.env`, not `.evn`.
 - `ELASTICSEARCH_TEXT_FIELD`: string field in `_source` to return. Dotted paths
   such as `document.text` are supported for ordinary object fields.
 
-For the supplied mapping, use:
+`.env.example` ships generic placeholders (for example `ELASTICSEARCH_INDEX=index_name`).
+Replace them with your index's real names. For an index whose vector field is
+`embedding` and text field is `content`, use:
 
 ```dotenv
-ELASTICSEARCH_INDEX=structural-rag-index
+ELASTICSEARCH_INDEX=your-index-name
 ELASTICSEARCH_VECTOR_FIELD=embedding
 ELASTICSEARCH_TEXT_FIELD=content
 ```
@@ -61,7 +63,7 @@ whether the input semantically asks a question; a question mark is not required.
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[test]"
+pip install -e .
 python -m uvicorn main:app --reload
 ```
 
@@ -75,7 +77,9 @@ python build_zip.py
 python tests/check_deployment.py
 ```
 
-API tests mock Gemini embeddings, Gemini generation, and Elasticsearch and require no live credentials.
+API tests mock Gemini embeddings, Gemini generation, and Elasticsearch and require no live
+credentials. They use only `unittest`, FastAPI's test client, and `httpx`, all installed by
+`pip install -e .`, so no extra test dependencies are needed.
 Rebuild the deployment archive after source or dependency changes.
 
 ## AWS Lambda
@@ -84,7 +88,8 @@ Rebuild the deployment archive after source or dependency changes.
 2. Set the handler to `lambda_function.lambda_handler`.
 3. Configure the variables above in Lambda; `.env` is not included in the ZIP.
    Allow outbound access to Gemini and Elasticsearch.
-4. Connect API Gateway route `GET /query` (payload format 2.0).
+4. Connect API Gateway route `GET /query`. The handler supports both HTTP API
+   payload format 2.0 and REST API payload format 1.0.
 5. Allow API Gateway to invoke the function. Route `/docs` and `/openapi.json`
    as well if Swagger UI is needed.
 
