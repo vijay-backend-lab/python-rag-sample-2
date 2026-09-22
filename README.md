@@ -185,6 +185,101 @@ more than 500 chunks returns 413;
 embedding, index-creation, or Elasticsearch indexing failures return 502; timeouts
 return 504; an invalid `ELASTICSEARCH_SIMILARITY` returns 503.
 
+## Examples
+
+### Ingest a document (`POST /ingest`)
+
+```bash
+curl -X POST "http://127.0.0.1:8001/ingest" \
+  -F "file=@trial-sop.pdf;type=application/pdf" \
+  -F "document_id=DOC-1" \
+  -F "document_type=SOP" \
+  -F "title=Trial SOP" \
+  -F "version=2" \
+  -F "effective_date=2026-01-15" \
+  -F "department=Quality" \
+  -F "status=active"
+```
+
+Response:
+
+```json
+{ "document_id": "DOC-1", "chunks_indexed": 7 }
+```
+
+Only `file`, `document_id`, and `document_type` are required. Each chunk is
+indexed at `_id` `DOC-1:0`, `DOC-1:1`, … so re-ingesting `DOC-1` replaces its
+chunks. Under the hood this issues a `HEAD`/`PUT` to create the index if needed,
+then a single `_bulk?refresh=wait_for` request whose NDJSON body looks like:
+
+```
+{"index":{"_index":"gov-index","_id":"DOC-1:0"}}
+{"content":"First chunk text...","embedding":[0.12,-0.03,0.44],"document_id":"DOC-1","chunk_index":0,"title":"Trial SOP","document_type":"SOP","version":"2","effective_date":"2026-01-15","department":"Quality","status":"active"}
+{"index":{"_index":"gov-index","_id":"DOC-1:1"}}
+{"content":"Second chunk text...","embedding":[0.09,0.21,-0.11],"document_id":"DOC-1","chunk_index":1,"title":"Trial SOP","document_type":"SOP","version":"2","effective_date":"2026-01-15","department":"Quality","status":"active"}
+```
+
+### Ask a question (`GET /query`)
+
+```bash
+curl "http://127.0.0.1:8000/query?query=What%20is%20the%20annual%20review%20policy%3F" \
+  -H "X-Permissions: READ_SOP, READ_AUDIT"
+```
+
+Add `&document_type=SOP` to restrict to a single permitted category.
+
+Response:
+
+```json
+{
+  "answer": "Trials must be reviewed annually.",
+  "citation": {
+    "document_id": "DOC-1",
+    "document_type": "SOP",
+    "title": "Trial SOP",
+    "version": "2",
+    "effective_date": "2026-01-15",
+    "chunk_index": 0
+  }
+}
+```
+
+### The Elasticsearch retrieval query it builds
+
+For the request above (permissions `READ_SOP, READ_AUDIT`), the query API sends a
+single `POST {ELASTICSEARCH_URL}/{ELASTICSEARCH_INDEX}/_search`. The same
+`document_type` terms filter is applied to both the BM25 (`query.bool`) and the
+semantic (`knn`) halves, so authorization is enforced on both:
+
+```json
+{
+  "size": 1,
+  "_source": [
+    "content", "document_id", "document_type",
+    "title", "version", "effective_date", "chunk_index"
+  ],
+  "query": {
+    "bool": {
+      "must": { "match": { "content": { "query": "What is the annual review policy?" } } },
+      "filter": { "terms": { "document_type": ["SOP", "AUDIT"] } }
+    }
+  },
+  "knn": {
+    "field": "embedding",
+    "query_vector": [0.12, -0.03, 0.44],
+    "k": 1,
+    "num_candidates": 100,
+    "filter": { "terms": { "document_type": ["SOP", "AUDIT"] } }
+  }
+}
+```
+
+`content`/`embedding` are the configured `ELASTICSEARCH_TEXT_FIELD` and
+`ELASTICSEARCH_VECTOR_FIELD`; `query_vector` is the question embedded with
+`RETRIEVAL_QUERY`. If `ELASTICSEARCH_MIN_SCORE` is set, a top-level `min_score` is
+added and sub-threshold hits yield a 404. With `document_type=SOP`, both filters
+narrow to `["SOP"]`.
+
 ## Run locally (Python 3.11+)
 
 ```powershell
