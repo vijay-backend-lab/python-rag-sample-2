@@ -7,11 +7,25 @@ from typing import Annotated
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import PlainTextResponse
-from pydantic import AfterValidator
+from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import AfterValidator, BaseModel
 
 app = FastAPI(title="Query API")
+
+
+class Citation(BaseModel):
+    """Source attribution for the chunk used to ground the answer."""
+    document_id: str | None = None
+    document_type: str | None = None
+    title: str | None = None
+    version: str | None = None
+    effective_date: str | None = None
+    chunk_index: int | None = None
+
+
+class QueryResponse(BaseModel):
+    answer: str
+    citation: Citation
 
 
 EMBEDDING_MODEL = "gemini-embedding-001"
@@ -47,6 +61,43 @@ def parse_min_score(value: str) -> float:
     return score
 
 
+# Document categories and the per-category permission that authorises reading
+# them. A caller presents its granted permissions in the X-Permissions header
+# (comma-separated), and retrieval is restricted to the matching categories.
+DOCUMENT_CATEGORIES = ("SOP", "CAPA", "AUDIT")
+PERMISSION_PREFIX = "READ_"
+
+
+def resolve_allowed_categories(permissions_header: str) -> list[str]:
+    """Map the caller's granted READ_* permissions to allowed categories.
+
+    Unknown permissions are ignored. A caller with no permission for any known
+    category cannot retrieve anything, so this raises 403 rather than running a
+    search that could only ever return forbidden content.
+    """
+    granted = {token.strip().upper() for token in permissions_header.split(",") if token.strip()}
+    allowed = [category for category in DOCUMENT_CATEGORIES
+               if f"{PERMISSION_PREFIX}{category}" in granted]
+    if not allowed:
+        raise HTTPException(403, "You do not have permission to read any document category.")
+    return allowed
+
+
+def resolve_requested_categories(document_type: str, allowed: list[str]) -> list[str]:
+    """Narrow the search to a requested category, enforcing the caller's permissions.
+
+    Without a requested type, the search spans every category the caller may
+    read. With one, it must be a known category the caller is permitted to read;
+    otherwise 403 (an unpermitted or unknown category is not disclosed as valid).
+    """
+    requested = document_type.strip().upper()
+    if not requested:
+        return allowed
+    if requested not in allowed:
+        raise HTTPException(403, "You do not have permission to read that document category.")
+    return [requested]
+
+
 async def embed_question(question: str) -> list[float]:
     """Create a retrieval vector that later pipeline steps can consume."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -79,8 +130,9 @@ async def embed_question(question: str) -> list[float]:
         raise HTTPException(502, "Embedding service returned an invalid vector.") from exc
 
 
-async def search_document(question: str, embedding: list[float]) -> str:
-    """Return the nearest document's text, without search metadata or vectors.
+async def search_document(question: str, embedding: list[float],
+                          categories: list[str]) -> tuple[str, Citation]:
+    """Return the nearest document's text and its source citation.
 
     Uses hybrid retrieval: a BM25 keyword match on the text field is combined
     with a semantic kNN search on the vector field in a single request. When
@@ -99,14 +151,20 @@ async def search_document(question: str, embedding: list[float]) -> str:
     if not url.startswith(("https://", "http://")):
         raise HTTPException(503, "Elasticsearch URL must use HTTP or HTTPS.")
     min_score = parse_min_score(os.environ.get("ELASTICSEARCH_MIN_SCORE", ""))
+    # Authorization-aware retrieval: restrict both halves of the hybrid search to
+    # the categories the caller is permitted to read. The same terms filter is
+    # applied to the lexical query and the kNN clause so neither can surface a
+    # document outside the allowed categories.
+    category_filter = {"terms": {"document_type": categories}}
+    citation_fields = ["document_id", "document_type", "title", "version",
+                       "effective_date", "chunk_index"]
     body = {
         "size": 1,
-        "_source": [text_field],
+        "_source": [text_field, *citation_fields],
         "query": {
-            "match": {
-                text_field: {
-                    "query": question,
-                },
+            "bool": {
+                "must": {"match": {text_field: {"query": question}}},
+                "filter": category_filter,
             },
         },
         "knn": {
@@ -114,6 +172,7 @@ async def search_document(question: str, embedding: list[float]) -> str:
             "query_vector": embedding,
             "k": 1,
             "num_candidates": 100,
+            "filter": category_filter,
         },
     }
     # Relevance filtering: ask Elasticsearch to drop hits whose combined
@@ -152,7 +211,17 @@ async def search_document(question: str, embedding: list[float]) -> str:
                 document = document[part]
         if not isinstance(document, str) or not document.strip():
             raise ValueError("Missing document text")
-        return document
+        top_source = hits[0]["_source"]
+        chunk_index = top_source.get("chunk_index")
+        citation = Citation(
+            document_id=top_source.get("document_id"),
+            document_type=top_source.get("document_type"),
+            title=top_source.get("title"),
+            version=top_source.get("version"),
+            effective_date=top_source.get("effective_date"),
+            chunk_index=chunk_index if isinstance(chunk_index, int) else None,
+        )
+        return document, citation
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise HTTPException(502, "Elasticsearch returned an invalid document.") from exc
 
@@ -204,12 +273,21 @@ async def generate_answer(question: str, context: str) -> str:
         raise HTTPException(502, "Generation service returned no complete answer.") from exc
 
 
-@app.get("/query", response_class=PlainTextResponse)
-async def query(query: Annotated[
-    str,
-    Query(min_length=1, max_length=2000, description="The user's question."),
-    AfterValidator(validate_question),
-]) -> str:
+@app.get("/query", response_model=QueryResponse)
+async def query(
+    query: Annotated[
+        str,
+        Query(min_length=1, max_length=2000, description="The user's question."),
+        AfterValidator(validate_question),
+    ],
+    x_permissions: Annotated[str, Header(
+        description="Comma-separated granted permissions, e.g. READ_SOP,READ_AUDIT.")] = "",
+    document_type: Annotated[str, Query(
+        description="Optional category to restrict to: SOP, CAPA, or AUDIT.")] = "",
+) -> QueryResponse:
+    allowed = resolve_allowed_categories(x_permissions)
+    categories = resolve_requested_categories(document_type, allowed)
     embedding = await embed_question(query)
-    context = await search_document(query, embedding)
-    return await generate_answer(query, context)
+    context, citation = await search_document(query, embedding, categories)
+    answer = await generate_answer(query, context)
+    return QueryResponse(answer=answer, citation=citation)

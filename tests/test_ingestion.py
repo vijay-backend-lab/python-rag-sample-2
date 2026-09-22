@@ -92,7 +92,9 @@ class IngestionTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def post(self, pdf_bytes, data=None, filename="doc.pdf"):
-        form = {"document_id": "DOC-1"}
+        # document_type is required and defaults to a valid category so tests
+        # focused on other behaviour don't need to repeat it.
+        form = {"document_id": "DOC-1", "document_type": "SOP"}
         if data:
             form.update(data)
         return self.client.post("/ingest", data=form,
@@ -192,10 +194,28 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
 
     def test_missing_document_id(self):
-        response = self.client.post("/ingest", data={"document_id": "  "},
+        response = self.client.post("/ingest", data={"document_id": "  ", "document_type": "SOP"},
             files={"file": ("d.pdf", make_pdf("hello"), "application/pdf")})
         self.assertEqual(response.status_code, 422)
         self.assertEqual(self.requests, [])
+
+    def test_document_type_required(self):
+        response = self.client.post("/ingest", data={"document_id": "DOC-1"},
+            files={"file": ("d.pdf", make_pdf("hello world"), "application/pdf")})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.requests, [])
+
+    def test_document_type_must_be_valid_category(self):
+        response = self.post(make_pdf("hello world"), data={"document_type": "POLICY"})
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(self.requests, [])
+
+    def test_document_type_case_insensitive(self):
+        response = self.post(make_pdf("hello world"), data={"document_type": "capa"})
+        self.assertEqual(response.status_code, 200)
+        bulk = next(r for r in self.requests if r.url.path.endswith("/_bulk"))
+        source = [json.loads(line) for line in bulk.content.decode("utf-8").strip().split("\n")][1]
+        self.assertEqual(source["document_type"], "CAPA")
 
     def test_non_pdf_rejected(self):
         response = self.post(b"not a pdf at all")

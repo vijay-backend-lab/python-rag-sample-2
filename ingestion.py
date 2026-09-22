@@ -36,6 +36,10 @@ MAX_CHUNKS = 500
 DEFAULT_SIMILARITY = "cosine"
 VALID_SIMILARITIES = ("cosine", "dot_product", "l2_norm", "max_inner_product")
 
+# Every ingested document is categorised as exactly one of these. Retrieval is
+# gated per category by a matching READ_<CATEGORY> permission on the query side.
+DOCUMENT_CATEGORIES = ("SOP", "CAPA", "AUDIT")
+
 load_dotenv()
 
 
@@ -129,11 +133,20 @@ def build_metadata(
     department: Optional[str],
     status: Optional[str],
 ) -> dict:
-    """Validate and normalise the enrichment metadata attached to each chunk."""
-    metadata: dict[str, str] = {}
+    """Validate and normalise the enrichment metadata attached to each chunk.
+
+    ``document_type`` is required and must be one of ``DOCUMENT_CATEGORIES``; the
+    value is upper-cased before validation so callers may send ``sop`` or ``SOP``.
+    """
+    category = (document_type or "").strip().upper()
+    if not category:
+        raise HTTPException(422, "document_type is required.")
+    if category not in DOCUMENT_CATEGORIES:
+        raise HTTPException(422, "document_type must be one of: "
+                            + ", ".join(DOCUMENT_CATEGORIES) + ".")
+    metadata: dict[str, str] = {"document_type": category}
     for key, value in (
         ("title", title),
-        ("document_type", document_type),
         ("version", version),
         ("department", department),
         ("status", status),
@@ -263,7 +276,7 @@ async def ingest(
     file: Annotated[UploadFile, File(description="PDF document to ingest.")],
     document_id: Annotated[str, Form(description="Stable identifier for the source document.")],
     title: Annotated[Optional[str], Form()] = None,
-    document_type: Annotated[Optional[str], Form(description="e.g. SOP, policy, compliance.")] = None,
+    document_type: Annotated[str, Form(description="Required category: SOP, CAPA, or AUDIT.")] = "",
     version: Annotated[Optional[str], Form()] = None,
     effective_date: Annotated[Optional[str], Form(description="ISO date YYYY-MM-DD.")] = None,
     department: Annotated[Optional[str], Form()] = None,

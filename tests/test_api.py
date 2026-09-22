@@ -25,7 +25,10 @@ class ApiTests(unittest.TestCase):
             "parts": [{"text": "Generated answer."}]}}]}
         self.search_status = 200
         self.search_timeout = False
-        self.search_payload = {"hits": {"hits": [{"_source": {"content": "Retrieved document. नमस्ते"}}]}}
+        self.search_payload = {"hits": {"hits": [{"_source": {
+            "content": "Retrieved document. नमस्ते", "document_id": "DOC-1",
+            "document_type": "SOP", "title": "Trial SOP", "version": "2",
+            "effective_date": "2026-01-15", "chunk_index": 0}}]}}
 
         def respond(request):
             self.requests.append(request)
@@ -51,7 +54,10 @@ class ApiTests(unittest.TestCase):
             transport=httpx.MockTransport(respond), **kwargs))
         mock.start()
         self.addCleanup(mock.stop)
-        self.client = TestClient(app)
+        # Default caller has permission to read every category, so existing
+        # tests exercise the pipeline without repeating the header. Permission
+        # gating is covered explicitly in the authorization tests below.
+        self.client = TestClient(app, headers={"X-Permissions": "READ_SOP,READ_CAPA,READ_AUDIT"})
         self.addCleanup(self.client.close)
 
     def test_questions_embedded(self):
@@ -59,8 +65,11 @@ class ApiTests(unittest.TestCase):
             with self.subTest(question=question):
                 response = self.client.get("/query", params={"query": question})
                 self.assertEqual(response.status_code, 200)
-                self.assertEqual(response.text, "Generated answer.")
-                self.assertEqual(response.headers["content-type"], "text/plain; charset=utf-8")
+                payload = response.json()
+                self.assertEqual(payload["answer"], "Generated answer.")
+                self.assertEqual(payload["citation"], {
+                    "document_id": "DOC-1", "document_type": "SOP", "title": "Trial SOP",
+                    "version": "2", "effective_date": "2026-01-15", "chunk_index": 0})
                 generation = self.requests[-1]
                 self.assertEqual(generation.url.path, f"/v1beta/models/{GENERATION_MODEL}:generateContent")
                 self.assertEqual(generation.headers["x-goog-api-key"], "test-key")
@@ -73,11 +82,16 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(str(search.url), "https://elastic.test/structural-rag-index/_search")
                 self.assertTrue(search.headers["authorization"].startswith("Basic "))
                 self.assertNotIn("x-goog-api-key", search.headers)
+                category_filter = {"terms": {"document_type": ["SOP", "CAPA", "AUDIT"]}}
                 self.assertEqual(json.loads(search.content), {
-                    "size": 1, "_source": ["content"],
-                    "query": {"match": {"content": {"query": question.strip()}}},
+                    "size": 1, "_source": ["content", "document_id", "document_type",
+                    "title", "version", "effective_date", "chunk_index"],
+                    "query": {"bool": {
+                        "must": {"match": {"content": {"query": question.strip()}}},
+                        "filter": category_filter}},
                     "knn": {"field": "embedding",
-                    "query_vector": [0.1, -0.2, 0.3], "k": 1, "num_candidates": 100}})
+                    "query_vector": [0.1, -0.2, 0.3], "k": 1, "num_candidates": 100,
+                    "filter": category_filter}})
                 request = self.requests[-3]
                 self.assertEqual(request.headers["x-goog-api-key"], "test-key")
                 self.assertEqual(json.loads(request.content), {
@@ -135,6 +149,60 @@ class ApiTests(unittest.TestCase):
         self.search_payload = {"hits": {"hits": []}}
         self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 404)
 
+    def test_citation_with_partial_metadata(self):
+        # Only some metadata present; absent fields are null, not errors.
+        self.search_payload = {"hits": {"hits": [{"_source": {
+            "content": "text", "document_id": "DOC-7", "document_type": "AUDIT"}}]}}
+        response = self.client.get("/query", params={"query": "Why?"})
+        self.assertEqual(response.status_code, 200)
+        citation = response.json()["citation"]
+        self.assertEqual(citation["document_id"], "DOC-7")
+        self.assertEqual(citation["document_type"], "AUDIT")
+        self.assertIsNone(citation["title"])
+        self.assertIsNone(citation["version"])
+        self.assertIsNone(citation["chunk_index"])
+
+    def test_no_permissions_forbidden(self):
+        # A caller without any READ_* permission cannot search at all.
+        response = self.client.get("/query", params={"query": "Why?"},
+                                   headers={"X-Permissions": ""})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.requests, [])
+
+    def test_unknown_permissions_forbidden(self):
+        response = self.client.get("/query", params={"query": "Why?"},
+                                   headers={"X-Permissions": "READ_UNKNOWN, WRITE_SOP"})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(self.requests, [])
+
+    def test_permitted_categories_filter_search(self):
+        response = self.client.get("/query", params={"query": "Why?"},
+                                   headers={"X-Permissions": "READ_SOP, read_audit"})
+        self.assertEqual(response.status_code, 200)
+        search = next(r for r in self.requests if r.url.host == "elastic.test")
+        body = json.loads(search.content)
+        # Permissions are case-insensitive; categories keep declaration order.
+        self.assertEqual(body["knn"]["filter"]["terms"]["document_type"], ["SOP", "AUDIT"])
+        self.assertEqual(body["query"]["bool"]["filter"]["terms"]["document_type"], ["SOP", "AUDIT"])
+
+    def test_requested_category_narrows_to_one(self):
+        response = self.client.get("/query", params={"query": "Why?", "document_type": "sop"},
+                                   headers={"X-Permissions": "READ_SOP,READ_AUDIT"})
+        self.assertEqual(response.status_code, 200)
+        search = next(r for r in self.requests if r.url.host == "elastic.test")
+        self.assertEqual(json.loads(search.content)["knn"]["filter"]["terms"]["document_type"], ["SOP"])
+
+    def test_requested_category_without_permission_forbidden(self):
+        response = self.client.get("/query", params={"query": "Why?", "document_type": "CAPA"},
+                                   headers={"X-Permissions": "READ_SOP,READ_AUDIT"})
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(any(r.url.host == "elastic.test" for r in self.requests))
+
+    def test_unknown_requested_category_forbidden(self):
+        response = self.client.get("/query", params={"query": "Why?", "document_type": "POLICY"},
+                                   headers={"X-Permissions": "READ_SOP,READ_CAPA,READ_AUDIT"})
+        self.assertEqual(response.status_code, 403)
+
     def test_min_score_applied(self):
         with patch.dict(os.environ, {"ELASTICSEARCH_MIN_SCORE": "1.5"}):
             response = self.client.get("/query", params={"query": "Why?"})
@@ -169,11 +237,16 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(self.client.get("/query", params={"query": "Why?"}).status_code, 502)
 
     def test_nested_text_field(self):
-        self.search_payload = {"hits": {"hits": [{"_source": {"document": {"text": "Nested text"}}}]}}
+        self.search_payload = {"hits": {"hits": [{"_source": {
+            "document": {"text": "Nested text"}, "document_id": "DOC-9"}}]}}
         with patch.dict(os.environ, {"ELASTICSEARCH_TEXT_FIELD": "document.text"}):
             response = self.client.get("/query", params={"query": "Why?"})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.text, "Generated answer.")
+        payload = response.json()
+        self.assertEqual(payload["answer"], "Generated answer.")
+        # Citation still populates from top-level metadata; missing fields are null.
+        self.assertEqual(payload["citation"]["document_id"], "DOC-9")
+        self.assertIsNone(payload["citation"]["title"])
         body = json.loads(self.requests[-1].content)
         self.assertEqual(json.loads(body["contents"][0]["parts"][0]["text"])["context"], "Nested text")
 
@@ -199,7 +272,8 @@ class ApiTests(unittest.TestCase):
     def test_multiple_answer_parts(self):
         self.generation_payload["candidates"][0]["content"]["parts"] = [
             {"text": "private thought", "thought": True}, {"text": "First "}, {"text": "second."}]
-        self.assertEqual(self.client.get("/query", params={"query": "Why?"}).text, "First second.")
+        self.assertEqual(self.client.get("/query", params={"query": "Why?"}).json()["answer"],
+                         "First second.")
 
     def test_no_generation_after_retrieval_failure(self):
         self.search_status = 500
@@ -215,15 +289,16 @@ class ApiTests(unittest.TestCase):
         event = json.loads((ROOT / "events/query.json").read_text())
         response = lambda_handler(event, None)
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(response["body"], "Generated answer.")
+        self.assertEqual(json.loads(response["body"])["answer"], "Generated answer.")
 
     def test_lambda_v1(self):
         event = {"resource": "/query", "path": "/query", "httpMethod": "GET",
-                 "headers": {"host": "localhost"}, "requestContext": {},
+                 "headers": {"host": "localhost", "x-permissions": "READ_SOP,READ_CAPA,READ_AUDIT"},
+                 "requestContext": {},
                  "queryStringParameters": {"query": "What is RAG?"}, "body": None}
         response = lambda_handler(event, None)
         self.assertEqual(response["statusCode"], 200)
-        self.assertEqual(response["body"], "Generated answer.")
+        self.assertEqual(json.loads(response["body"])["answer"], "Generated answer.")
 
 
 if __name__ == "__main__":

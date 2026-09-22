@@ -4,7 +4,8 @@
   "rawPath": "/query",
   "rawQueryString": "query=hello",
   "headers": {
-    "host": "localhost"
+    "host": "localhost",
+    "x-permissions": "READ_SOP,READ_CAPA,READ_AUDIT"
   },
   "requestContext": {
     "http": {
